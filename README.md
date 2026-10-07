@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="DataProof logo" width="420">
+</p>
+
 # DataProof
 
 Recalculate the numbers in a report from the data behind them.
