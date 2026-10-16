@@ -29,6 +29,9 @@ AGGREGATES: dict[str, Callable[[list[float]], float]] = {
 }
 
 
+CSV_OPS = (*AGGREGATES, "share", "pearson", "slope")
+
+
 def _values(check: dict[str, Any], key: str = "values") -> list[float]:
     raw = require(check, key, list)
     if not raw:
@@ -36,29 +39,127 @@ def _values(check: dict[str, Any], key: str = "values") -> list[float]:
     return [number(v) for v in raw]
 
 
-def _csv_column(root: str | Path, check: dict[str, Any]) -> list[float]:
+class DataError(InputError):
+    """The data a check points at cannot be used. Reported on that check only."""
+
+
+FILTER_OPS = ("equals", "not_equals", "in", "gt", "gte", "lt", "lte")
+
+
+def _conditions(check: dict[str, Any]) -> list[dict[str, Any]]:
+    """`filter` is one condition or a list of them, all of which must hold for a row."""
+    raw = check.get("filter")
+    if raw is None:
+        return []
+    conditions = raw if isinstance(raw, list) else [raw]
+    for cond in conditions:
+        if not isinstance(cond, dict) or not isinstance(cond.get("column"), str):
+            raise InputError("each filter needs a 'column' and one of: " + ", ".join(FILTER_OPS))
+        ops = [op for op in FILTER_OPS if op in cond]
+        if len(ops) != 1 or set(cond) - {"column", *ops}:
+            raise InputError(
+                "each filter needs a 'column' and exactly one of: " + ", ".join(FILTER_OPS)
+            )
+        if ops[0] == "in" and not isinstance(cond["in"], list):
+            raise InputError("filter 'in' must be an array")
+    return conditions
+
+
+def _holds(cond: dict[str, Any], row: dict[str, str | None]) -> bool:
+    cell = (row.get(cond["column"]) or "").strip()
+    if "equals" in cond:
+        return cell == str(cond["equals"]).strip()
+    if "not_equals" in cond:
+        return cell != str(cond["not_equals"]).strip()
+    if "in" in cond:
+        return cell in {str(v).strip() for v in cond["in"]}
+    op = next(op for op in ("gt", "gte", "lt", "lte") if op in cond)
+    try:
+        value, limit = number(cell.replace(",", "")), number(cond[op])
+    except InputError:
+        return False  # a blank or text cell is not in a numeric range
+    return {"gt": value > limit, "gte": value >= limit, "lt": value < limit, "lte": value <= limit}[
+        op
+    ]
+
+
+def _csv_rows(root: str | Path, check: dict[str, Any], columns: list[str]):
+    """(line, row) for every row that passes the filter. Also returns the unfiltered row count."""
     path = inside(root, require(check, "path", str))
-    column = require(check, "column", str)
+    conditions = _conditions(check)
     if not path.is_file():
-        raise InputError(f"CSV file not found: {check['path']}")
+        raise DataError(f"CSV file not found: {check['path']}")
     if path.stat().st_size > MAX_CSV_BYTES:
-        raise InputError(f"CSV file is larger than {MAX_CSV_BYTES // 1024 // 1024} MiB")
-    values: list[float] = []
+        raise DataError(f"CSV file is larger than {MAX_CSV_BYTES // 1024 // 1024} MiB")
+    kept: list[tuple[int, dict[str, str | None]]] = []
+    total = 0
     with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
-        if reader.fieldnames is None or column not in reader.fieldnames:
-            raise InputError(f"Column '{column}' not found in {check['path']}")
+        needed = [*columns, *(c["column"] for c in conditions)]
+        for column in needed:
+            if reader.fieldnames is None or column not in reader.fieldnames:
+                raise DataError(f"Column '{column}' not found in {check['path']}")
         for line, row in enumerate(reader, start=2):
-            cell = (row.get(column) or "").strip().replace(",", "")
-            if not cell:
-                continue  # blanks are skipped, and counted in the evidence
-            try:
-                values.append(number(cell))
-            except InputError:
-                raise InputError(f"{check['path']} line {line}: '{cell}' is not a number") from None
+            total += 1
+            if all(_holds(c, row) for c in conditions):
+                kept.append((line, row))
+    if conditions and not kept:
+        raise DataError(f"The filter matched no rows in {check['path']}")
+    return kept, total
+
+
+def _numeric(
+    rows: list[tuple[int, dict[str, str | None]]], column: str, path: str
+) -> list[tuple[int, float]]:
+    out = []
+    for line, row in rows:
+        cell = (row.get(column) or "").strip().replace(",", "")
+        if not cell:
+            continue  # blanks are skipped, and counted in the evidence
+        try:
+            out.append((line, number(cell)))
+        except InputError:
+            raise DataError(f"{path} line {line}: '{cell}' is not a number") from None
+    return out
+
+
+def _csv_column(root: str | Path, check: dict[str, Any]) -> list[float]:
+    column = require(check, "column", str)
+    rows, _ = _csv_rows(root, check, [column])
+    values = [v for _, v in _numeric(rows, column, check["path"])]
     if not values:
-        raise InputError(f"Column '{column}' has no numeric values")
+        raise DataError(f"Column '{column}' has no numeric values")
     return values
+
+
+def _csv_pair(root: str | Path, check: dict[str, Any]) -> tuple[list[float], list[float]]:
+    """Rows where both columns hold a number: y from `column`, x from `column2`."""
+    y_col, x_col = require(check, "column", str), require(check, "column2", str)
+    rows, _ = _csv_rows(root, check, [y_col, x_col])
+    ys, xs = dict(_numeric(rows, y_col, check["path"])), dict(_numeric(rows, x_col, check["path"]))
+    lines = sorted(set(ys) & set(xs))
+    if len(lines) < 3:
+        raise DataError(f"Fewer than 3 rows have numbers in both '{y_col}' and '{x_col}'")
+    return [ys[n] for n in lines], [xs[n] for n in lines]
+
+
+def _csv_share(root: str | Path, check: dict[str, Any]) -> tuple[float, int, int]:
+    """Percent of rows that pass `filter`, out of the rows that pass `within` (default: all).
+
+    Only rows with something in `column` are counted, so a blank is neither in the numerator
+    nor the denominator. `column` may hold text.
+    """
+    column = require(check, "column", str)
+    conditions = _conditions(check)
+    if not conditions:
+        raise InputError("op 'share' needs a filter")
+    scope = {**check, "filter": check.get("within")}
+    rows, _ = _csv_rows(root, scope, [column, *(c["column"] for c in conditions)])
+    counted = [row for _, row in rows if (row.get(column) or "").strip()]
+    if not counted:
+        raise DataError(f"Column '{column}' has no values in the rows counted")
+    matched = sum(1 for row in counted if all(_holds(c, row) for c in conditions))
+    return 100 * matched / len(counted), matched, len(counted)
 
 
 def recalculate(kind: str, check: dict[str, Any], root: str | Path) -> tuple[float, dict[str, Any]]:
@@ -84,15 +185,31 @@ def recalculate(kind: str, check: dict[str, Any], root: str | Path) -> tuple[flo
         return AGGREGATES[kind](_values(check)), {"n": len(check["values"])}
     if kind == "csv":
         op = require(check, "op", str)
-        if op not in AGGREGATES:
-            raise InputError("csv op must be one of: " + ", ".join(AGGREGATES))
+        if op not in CSV_OPS:
+            raise InputError("csv op must be one of: " + ", ".join(CSV_OPS))
+        evidence: dict[str, Any] = {"file": check["path"], "column": check["column"], "op": op}
+        for key in ("filter", "within"):
+            if check.get(key) is not None:
+                evidence[key] = check[key]
+        if op == "share":
+            value, matched, total = _csv_share(root, check)
+            return value, {**evidence, "rows_matching": matched, "rows_used": total}
+        if op in ("pearson", "slope"):
+            ys, xs = _csv_pair(root, check)
+            evidence.update(column2=check["column2"], rows_used=len(ys))
+            if op == "pearson":
+                try:
+                    return statistics.correlation(xs, ys), evidence
+                except statistics.StatisticsError:
+                    raise DataError(
+                        "A column is constant, so the correlation is undefined"
+                    ) from None
+            try:
+                return statistics.linear_regression(xs, ys).slope, evidence
+            except statistics.StatisticsError:
+                raise DataError("'column2' is constant, so the slope is undefined") from None
         values = _csv_column(root, check)
-        return AGGREGATES[op](values), {
-            "file": check["path"],
-            "column": check["column"],
-            "op": op,
-            "rows_used": len(values),
-        }
+        return AGGREGATES[op](values), {**evidence, "rows_used": len(values)}
     if kind == "match":
         return number(check["source_value"]), {}
     raise InputError(f"Unknown check type: {kind}")
@@ -126,6 +243,19 @@ def dataproof(data: dict[str, Any], root: str | Path = ".") -> dict[str, Any]:
             expected, extra = recalculate(kind, check, root)
         except KeyError as exc:
             raise InputError(f"Check {index} ({kind}) is missing {exc.args[0]!r}") from None
+        except DataError as exc:
+            # The checks file is fine; this check's data is not. Say so and carry on.
+            out.append(
+                finding(
+                    "ERROR",
+                    str(exc),
+                    type=kind,
+                    reported=reported,
+                    label=check.get("label"),
+                    lineage=check.get("lineage", []),
+                )
+            )
+            continue
         tolerance = tolerance_for(check)
         passed = abs(expected - reported) <= tolerance
         evidence: dict[str, Any] = {

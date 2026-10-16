@@ -108,17 +108,200 @@ def test_csv_with_a_byte_order_mark(tmp_path: Path) -> None:
     assert f["status"] == "PASS"
 
 
-def test_csv_errors(tmp_path: Path) -> None:
+def test_csv_data_errors_are_reported_on_that_check(tmp_path: Path) -> None:
     write_csv(tmp_path / "d.csv", "a\n1\nabc\n")
     base = {"type": "csv", "path": "d.csv", "op": "sum", "reported": 1}
-    with pytest.raises(InputError, match="line 3"):
-        one({**base, "column": "a"}, tmp_path)
-    with pytest.raises(InputError, match="not found"):
-        one({**base, "column": "zzz"}, tmp_path)
-    with pytest.raises(InputError, match="not found"):
-        one({**base, "path": "missing.csv", "column": "a"}, tmp_path)
+    for check, message in [
+        ({**base, "column": "a"}, "line 3"),
+        ({**base, "column": "zzz"}, "not found"),
+        ({**base, "path": "missing.csv", "column": "a"}, "not found"),
+    ]:
+        f = one(check, tmp_path)
+        assert f["status"] == "ERROR" and message in f["message"], check
+        assert f["evidence"]["reported"] == 1
+
+
+def test_unusable_checks_file_is_still_rejected(tmp_path: Path) -> None:
+    write_csv(tmp_path / "d.csv", "a\n1\n")
+    base = {"type": "csv", "path": "d.csv", "column": "a", "reported": 1}
     with pytest.raises(InputError):
-        one({**base, "column": "a", "op": "stdev"}, tmp_path)
+        one({**base, "op": "stdev"}, tmp_path)
+    with pytest.raises(InputError):
+        one({**base}, tmp_path)  # no op
+
+
+def test_one_unreadable_csv_does_not_stop_the_other_checks(tmp_path: Path) -> None:
+    write_csv(tmp_path / "d.csv", "a\n1\n2\n")
+    checks = [
+        {"type": "csv", "path": "d.csv", "column": "a", "op": "sum", "reported": 3},
+        {"type": "csv", "path": "gone.csv", "column": "a", "op": "sum", "reported": 3},
+        {"type": "sum", "values": [1, 2], "reported": 4},
+    ]
+    statuses = [f["status"] for f in dataproof({"checks": checks}, tmp_path)["findings"]]
+    assert statuses == ["PASS", "ERROR", "MISMATCH"]
+
+
+GROUPS = (
+    "station,score,hours\n"
+    "North,10,1\nNorth,20,2\nNorth,30,3\n"
+    "South,40,4\nSouth,50,5\n"
+    "East,,6\nEast,70,7\n"
+)
+
+
+def csv_check(tmp_path: Path, **kw: Any) -> dict[str, Any]:
+    write_csv(tmp_path / "g.csv", GROUPS)
+    base = {"type": "csv", "path": "g.csv", "column": "score", "op": "mean", "reported": 0}
+    return one({**base, **kw}, tmp_path)
+
+
+def test_filter_restricts_the_rows_used(tmp_path: Path) -> None:
+    f = csv_check(
+        tmp_path, filter={"column": "station", "equals": "North"}, reported=20, decimals=1
+    )
+    assert f["status"] == "PASS"
+    assert f["evidence"]["rows_used"] == 3
+    assert f["evidence"]["filter"] == {"column": "station", "equals": "North"}
+    wrong = csv_check(tmp_path, filter={"column": "station", "equals": "North"}, reported=35)
+    assert wrong["status"] == "MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("flt", "op", "expected"),
+    [
+        ({"column": "station", "not_equals": "North"}, "count", 3),  # East's blank is skipped
+        ({"column": "station", "in": ["North", "South"]}, "sum", 150),
+        ({"column": "hours", "gt": 4}, "sum", 120),
+        ({"column": "hours", "gte": 4}, "sum", 160),
+        ({"column": "hours", "lt": 3}, "max", 20),
+        ({"column": "hours", "lte": 3}, "sum", 60),
+        (
+            [{"column": "station", "in": ["North", "East"]}, {"column": "hours", "gt": 2}],
+            "sum",
+            100,
+        ),
+    ],
+)
+def test_filter_operators(tmp_path: Path, flt: Any, op: str, expected: float) -> None:
+    f = csv_check(tmp_path, filter=flt, op=op, reported=expected)
+    assert f["status"] == "PASS", f
+
+
+def test_share_is_a_percentage_of_rows(tmp_path: Path) -> None:
+    # 6 rows have a score; 3 are North
+    f = csv_check(
+        tmp_path,
+        op="share",
+        filter={"column": "station", "equals": "North"},
+        reported=50.0,
+        decimals=1,
+    )
+    assert f["status"] == "PASS"
+    assert (f["evidence"]["rows_matching"], f["evidence"]["rows_used"]) == (3, 6)
+    off = csv_check(
+        tmp_path,
+        op="share",
+        filter={"column": "station", "equals": "North"},
+        reported=60.0,
+        decimals=1,
+    )
+    assert off["status"] == "MISMATCH"
+
+
+def test_share_within_a_group_on_a_text_column(tmp_path: Path) -> None:
+    write_csv(
+        tmp_path / "t.csv",
+        "station,member\nCampus,Yes\nCampus,No\nCampus,Yes\nCampus,\nQuay,Yes\nQuay,Yes\n",
+    )
+    base = {"type": "csv", "path": "t.csv", "column": "member", "op": "share"}
+    f = one(
+        {
+            **base,
+            "filter": {"column": "member", "equals": "Yes"},
+            "within": {"column": "station", "equals": "Campus"},
+            "reported": 66.7,
+            "decimals": 1,
+        },
+        tmp_path,
+    )  # the blank Campus row is not counted: 2 of 3
+    assert f["status"] == "PASS"
+    assert (f["evidence"]["rows_matching"], f["evidence"]["rows_used"]) == (2, 3)
+    assert f["evidence"]["within"] == {"column": "station", "equals": "Campus"}
+    overall = one(
+        {**base, "filter": {"column": "member", "equals": "Yes"}, "reported": 80.0, "decimals": 1},
+        tmp_path,
+    )
+    assert overall["status"] == "PASS"  # 4 of 5 rows with a value
+
+
+def test_share_within_a_group_that_does_not_exist_is_a_check_error(tmp_path: Path) -> None:
+    write_csv(tmp_path / "t.csv", "station,member\nCampus,Yes\n")
+    f = one(
+        {
+            "type": "csv", "path": "t.csv", "column": "member", "op": "share", "reported": 1,
+            "filter": {"column": "member", "equals": "Yes"},
+            "within": {"column": "station", "equals": "Nowhere"},
+        },
+        tmp_path,
+    )  # fmt: skip
+    assert f["status"] == "ERROR" and "matched no rows" in f["message"]
+
+
+def test_share_without_a_filter_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(InputError, match="needs a filter"):
+        csv_check(tmp_path, op="share", reported=100)
+
+
+def test_pearson_and_slope(tmp_path: Path) -> None:
+    write_csv(tmp_path / "x.csv", "y,x\n2,1\n4,2\n6,3\n8,4\n")
+    base = {"type": "csv", "path": "x.csv", "column": "y", "column2": "x"}
+    r = one({**base, "op": "pearson", "reported": 1.0, "decimals": 3}, tmp_path)
+    assert r["status"] == "PASS" and r["evidence"]["column2"] == "x"
+    slope = one({**base, "op": "slope", "reported": 2.0, "decimals": 2}, tmp_path)
+    assert slope["status"] == "PASS"
+    wrong = one({**base, "op": "slope", "reported": 2.5, "decimals": 2}, tmp_path)
+    assert wrong["status"] == "MISMATCH"
+
+
+def test_pearson_uses_only_rows_with_both_numbers_and_the_filter(tmp_path: Path) -> None:
+    write_csv(tmp_path / "x.csv", "g,y,x\na,1,1\na,2,2\na,3,3\na,,4\nb,9,1\nb,1,2\nb,9,3\n")
+    f = one(
+        {
+            "type": "csv", "path": "x.csv", "column": "y", "column2": "x", "op": "pearson",
+            "filter": {"column": "g", "equals": "a"}, "reported": 1.0, "decimals": 3,
+        },
+        tmp_path,
+    )  # fmt: skip
+    assert f["status"] == "PASS" and f["evidence"]["rows_used"] == 3
+
+
+def test_undefined_statistics_and_empty_filters_are_check_errors(tmp_path: Path) -> None:
+    write_csv(tmp_path / "x.csv", "g,y,x\na,1,5\na,2,5\na,3,5\n")
+    base = {"type": "csv", "path": "x.csv", "column": "y", "column2": "x", "reported": 0}
+    assert "constant" in one({**base, "op": "pearson"}, tmp_path)["message"]
+    assert "constant" in one({**base, "op": "slope"}, tmp_path)["message"]
+    none = one({**base, "op": "mean", "filter": {"column": "g", "equals": "zzz"}}, tmp_path)
+    assert none["status"] == "ERROR" and "matched no rows" in none["message"]
+    short = one({**base, "op": "pearson", "filter": {"column": "y", "gt": 2}}, tmp_path)
+    assert short["status"] == "ERROR" and "Fewer than 3" in short["message"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"column": "g"},
+        {"column": "g", "equals": "a", "gt": 1},
+        {"equals": "a"},
+        {"column": "g", "in": "a"},
+        {"column": "g", "equals": "a", "extra": 1},
+        "g=a",
+    ],
+)
+def test_malformed_filters_are_rejected(tmp_path: Path, bad: Any) -> None:
+    write_csv(tmp_path / "x.csv", "g,y\na,1\n")
+    check = {"type": "csv", "path": "x.csv", "column": "y", "op": "sum", "reported": 1}
+    with pytest.raises(InputError):
+        one({**check, "filter": bad}, tmp_path)
 
 
 def test_csv_cannot_escape_the_root(tmp_path: Path) -> None:
