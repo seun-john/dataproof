@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The report has a `coverage` block (checks decided and undecided, reasons, and a note that claims without a check are not counted), a one-line summary on stderr, and the same line in the HTML report.
+- `--min-coverage PCT`: exit 3 when fewer than PCT percent of checks were decided and nothing else failed.
 - `csv` checks accept `filter` (`equals`, `not_equals`, `in`, `gt`, `gte`, `lt`, `lte`; one condition or a list), so group means, sums and counts can be checked.
 - New `csv` operations: `share` (percentage of rows passing `filter` out of those passing `within`, text columns allowed), `pearson` and `slope` (with `column2`).
 - A check whose data cannot be used now yields an `ERROR` finding for that check, and the other checks still run. Before, the first such check stopped the whole run with exit 2. Malformed checks files still exit 2.

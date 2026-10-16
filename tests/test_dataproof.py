@@ -331,6 +331,63 @@ def test_lineage_and_label_are_kept() -> None:
     assert f["evidence"]["lineage"] == ["raw.xlsx!B2"]
 
 
+def test_coverage_counts_checks_decided_and_unusable(tmp_path: Path) -> None:
+    write_csv(tmp_path / "d.csv", "a\n1\n2\n")
+    checks = [
+        {"type": "csv", "path": "d.csv", "column": "a", "op": "sum", "reported": 3},  # pass
+        {"type": "sum", "values": [1, 2], "reported": 4},  # mismatch: still decided
+        {"type": "csv", "path": "gone.csv", "column": "a", "op": "sum", "reported": 3},  # error
+        {"type": "csv", "path": "d.csv", "column": "zzz", "op": "sum", "reported": 3},  # error
+    ]
+    block = dataproof({"checks": checks}, tmp_path)["coverage"]
+    assert (block["unit"], block["items"], block["decided"], block["undecided"]) == (
+        "checks",
+        4,
+        2,
+        2,
+    )
+    assert block["reasons"] == {"data_unusable": 2}
+    assert block["suppressed"] == 0
+    assert block["decided"] + block["undecided"] == block["items"]
+    assert sum(block["reasons"].values()) == block["undecided"]
+
+
+def test_coverage_with_no_checks_has_no_items() -> None:
+    block = dataproof({"checks": []})["coverage"]
+    assert (block["items"], block["decided"], block["undecided"], block["reasons"]) == (0, 0, 0, {})
+
+
+def test_cli_min_coverage_and_the_stderr_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_csv(tmp_path / "d.csv", "a\n1\n2\n")
+    checks = [
+        {"type": "csv", "path": "d.csv", "column": "a", "op": "sum", "reported": 3},
+        {"type": "csv", "path": "gone.csv", "column": "a", "op": "sum", "reported": 3},
+    ]
+    src = tmp_path / "in.json"
+    src.write_text(json.dumps({"checks": checks}), encoding="utf-8")
+    base = ["check", str(src), "--root", str(tmp_path), "-o", str(tmp_path / "r.json")]
+    assert main([*base, "--min-coverage", "50"]) == 0  # 1 of 2 = 50%
+    assert "coverage: decided 1 of 2 checks; 1 could not be checked (data_unusable 1)" in (
+        capsys.readouterr().err
+    )
+    assert main([*base, "--min-coverage", "51"]) == 3
+    assert main([*base]) == 0  # opt-in
+    # a --strict failure still wins over low coverage
+    assert main([*base, "--strict", "--min-coverage", "100"]) == 1
+    written = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
+    assert written["coverage"]["items"] == 2
+
+
+def test_html_report_shows_the_coverage_line(tmp_path: Path) -> None:
+    src = tmp_path / "in.json"
+    src.write_text(json.dumps({"checks": [{"type": "sum", "values": [1], "reported": 1}]}), "utf-8")
+    page = tmp_path / "r.html"
+    assert main(["check", str(src), "-o", str(tmp_path / "r.json"), "--html", str(page)]) == 0
+    assert "decided 1 of 1 checks" in page.read_text(encoding="utf-8")
+
+
 def test_cli_strict_and_root(tmp_path: Path) -> None:
     write_csv(tmp_path / "d.csv", "x\n1\n2\n")
     src = tmp_path / "in.json"

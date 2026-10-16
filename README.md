@@ -64,7 +64,9 @@ If the data a check points at cannot be used (file or column missing, a non-nume
 
 CSV paths must be inside `--root`; anything that escapes it is refused. Files over 20 MiB are refused. Non-numeric cells stop the check with the line number.
 
-All commands take `-o report.json`, `--html report.html` and `--strict`. Exit codes: 0 completed, 1 `--strict` and a mismatch (or no checks) was reported, 2 unusable input.
+All commands take `-o report.json`, `--html report.html` and `--strict`. Exit codes: 0 completed, 1 `--strict` and a mismatch (or no checks) was reported, 2 unusable input, 3 `--min-coverage` was not met.
+
+**Coverage.** The report has a `coverage` object, and a line on stderr: `coverage: decided 8 of 10 checks; 2 could not be checked (data_unusable 2)`. A check is decided when it came out `PASS` or `MISMATCH`; it is undecided when its data could not be used (`ERROR`, reason `data_unusable`). Claims that nobody wrote a check for are not counted, because DataProof cannot see them; the report says so in `notes`. `--min-coverage PCT` exits 3 when fewer than PCT percent of the checks were decided and nothing else failed; `--strict` mismatches still exit 1.
 
 ## Limits
 

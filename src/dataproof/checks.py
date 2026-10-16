@@ -14,7 +14,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 
-from .core import InputError, finding, inside, number, report, require
+from .core import InputError, coverage, finding, inside, number, report, require
 
 MAX_CSV_BYTES = 20 * 1024 * 1024
 DEFAULT_TOLERANCE = 0.05
@@ -279,8 +279,19 @@ def dataproof(data: dict[str, Any], root: str | Path = ".") -> dict[str, Any]:
         )
     if not checks:
         out.append(finding("NEEDS_REVIEW", "No checks were supplied."))
+    errored = sum(1 for f in out if f["status"] == "ERROR")
     return report(
         "DataProof",
         out,
+        coverage=coverage(
+            "checks",
+            len(checks),
+            len(checks) - errored,
+            {"data_unusable": errored},
+            notes=[
+                "only the claims written as checks were examined; claims with no check "
+                "(for example t-tests) were not"
+            ],
+        ),
         scope="recalculation only; does not judge whether the right quantity was reported",
     )
