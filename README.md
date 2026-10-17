@@ -58,6 +58,17 @@ Each check gives `PASS`, `MISMATCH` or, when its data cannot be used, `ERROR`, w
 - `share` is the percentage of rows that pass `filter`, out of the rows that pass `within` (default: all rows). Only rows with something in `column` count, and `column` may be text.
 - `pearson` is the correlation of `column` and `column2`; `slope` is the least-squares slope of `column` (y) on `column2` (x). Only rows with a number in both are used, after the filter, and at least 3 are needed.
 
+**Two groups and period patterns.** Two more operations compare groups and test a described pattern:
+
+```json
+{"type": "csv", "path": "d.csv", "column": "yield", "group_column": "field", "groups": ["Mill Field", "Long Acre"], "op": "welch_t", "reported": 6.07, "decimals": 2}
+{"type": "csv", "path": "d.csv", "column": "yield", "group_column": "field", "groups": ["Mill Field", "Long Acre"], "op": "welch_p", "reported": 0.509, "decimals": 3}
+{"type": "trend", "path": "d.csv", "column": "charge_usd", "period_column": "quarter", "periods": ["Q1", "Q2", "Q3"], "pattern": "falling"}
+```
+
+- `welch_t` is Welch's t for mean(first group) minus mean(second group), so the order of `groups` sets the sign. `welch_p` is its p-value from Student's t with the Welch-Satterthwaite degrees of freedom, computed with the standard library (an incomplete beta function). It is two-sided unless you give `"tails": 1`, which halves it. Each group needs at least 2 numbers. A claim that gives both t and p needs one check for each; the evidence shows the group sizes and the degrees of freedom.
+- `trend` has no `reported` number. It adds up `column` for each of the `periods` (or averages with `"agg": "mean"`) and passes when `pattern` holds: `rising` or `falling` (every step strictly up or down, in the order listed), or `peak` / `trough` (the period named in `at`, among at least three periods, is strictly higher or lower than all the others). The totals are in the evidence. A tie is not a rise.
+
 If the data a check points at cannot be used (file or column missing, a non-numeric cell, a filter that matches no rows, a constant column), that check gets an `ERROR` finding with the reason and the others still run. Under `--strict`, `ERROR` counts like a mismatch (exit 1). A malformed checks file (unknown type or operation, a missing field, a bad filter) still stops the run with exit 2.
 
 **Precision.** Say how the report rounded with `"decimals": 1` and DataProof allows half a unit in the last place, so `66.7` matches 2/3 as a percentage and `66.6` does not. Without `decimals`, an absolute `tolerance` applies (default 0.05).
@@ -71,7 +82,7 @@ All commands take `-o report.json`, `--html report.html` and `--strict`. Exit co
 ## Limits
 
 - DataProof recomputes. It cannot tell whether the right quantity was reported, whether a denominator was appropriate, or whether a statistical test was valid.
-- There is no check for t-tests, p-values or regression coefficients other than the simple slope, because the Python standard library has no t distribution. Those claims have to be checked another way.
+- The only tests are Welch's t and its p-value. There is no check for other tests (paired, Mann-Whitney, chi-squared), for confidence intervals, or for regression coefficients other than the simple slope.
 - Only JSON and CSV inputs. There is no XLSX or SPSS import, no formula comparison and no chart checking.
 - Floating-point arithmetic is used, which is why a tolerance or `decimals` is always applied.
 

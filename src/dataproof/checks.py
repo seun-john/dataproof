@@ -8,9 +8,11 @@ inspected.
 from __future__ import annotations
 
 import csv
+import math
 import statistics
 from collections.abc import Callable
 from decimal import ROUND_HALF_UP, Decimal
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +31,8 @@ AGGREGATES: dict[str, Callable[[list[float]], float]] = {
 }
 
 
-CSV_OPS = (*AGGREGATES, "share", "pearson", "slope")
+CSV_OPS = (*AGGREGATES, "share", "pearson", "slope", "welch_t", "welch_p")
+PATTERNS = ("rising", "falling", "peak", "trough")
 
 
 def _values(check: dict[str, Any], key: str = "values") -> list[float]:
@@ -162,6 +165,127 @@ def _csv_share(root: str | Path, check: dict[str, Any]) -> tuple[float, int, int
     return 100 * matched / len(counted), matched, len(counted)
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the incomplete beta function (modified Lentz)."""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 500):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-14:
+            break
+    return h
+
+
+def betainc(a: float, b: float, x: float) -> float:
+    """Regularised incomplete beta function I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_front = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x)
+    )
+    front = math.exp(log_front)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def t_two_sided_p(t: float, df: float) -> float:
+    """Two-sided p-value of Student's t with `df` degrees of freedom (df need not be whole)."""
+    return betainc(df / 2.0, 0.5, df / (df + t * t))
+
+
+def welch(a: list[float], b: list[float]) -> tuple[float, float]:
+    """Welch's t statistic for mean(a) - mean(b), and its degrees of freedom."""
+    va, vb = statistics.variance(a) / len(a), statistics.variance(b) / len(b)
+    if va + vb == 0:
+        raise DataError("Both groups are constant, so the t statistic is undefined")
+    t = (statistics.fmean(a) - statistics.fmean(b)) / math.sqrt(va + vb)
+    df = (va + vb) ** 2 / (va**2 / (len(a) - 1) + vb**2 / (len(b) - 1))
+    return t, df
+
+
+def _csv_groups(root: str | Path, check: dict[str, Any]) -> tuple[list[float], list[float]]:
+    """The numbers in `column` for each of the two `groups` of `group_column`."""
+    column = require(check, "column", str)
+    group_column = require(check, "group_column", str)
+    names = require(check, "groups", list)
+    if len(names) != 2 or names[0] == names[1]:
+        raise InputError("'groups' must name two different groups")
+    rows, _ = _csv_rows(root, check, [column, group_column])
+    out = []
+    for name in names:
+        chosen = [r for r in rows if (r[1].get(group_column) or "").strip() == str(name).strip()]
+        values = [v for _, v in _numeric(chosen, column, check["path"])]
+        if len(values) < 2:
+            raise DataError(f"Group '{name}' has fewer than 2 numbers in '{column}'")
+        out.append(values)
+    return out[0], out[1]
+
+
+def _trend(check: dict[str, Any], root: str | Path) -> tuple[bool, dict[str, Any]]:
+    """Does a pattern over ordered periods hold? `periods` are values of `period_column`; each
+    period's total (or `agg` mean) of `column` is compared with the next."""
+    column = require(check, "column", str)
+    period_column = require(check, "period_column", str)
+    periods = require(check, "periods", list)
+    pattern = require(check, "pattern", str)
+    if pattern not in PATTERNS:
+        raise InputError("trend pattern must be one of: " + ", ".join(PATTERNS))
+    agg = check.get("agg", "sum")
+    if agg not in ("sum", "mean"):
+        raise InputError("trend agg must be 'sum' or 'mean'")
+    if len(periods) < (3 if pattern in ("peak", "trough") else 2) or len(set(periods)) != len(
+        periods
+    ):
+        raise InputError("trend needs distinct periods: at least 2, or 3 for peak and trough")
+    rows, _ = _csv_rows(root, check, [column, period_column])
+    totals: dict[str, float] = {}
+    for period in periods:
+        chosen = [r for r in rows if (r[1].get(period_column) or "").strip() == str(period).strip()]
+        values = [v for _, v in _numeric(chosen, column, check["path"])]
+        if not values:
+            raise DataError(f"No numbers in '{column}' for period '{period}'")
+        totals[str(period)] = AGGREGATES[agg](values)
+    series = list(totals.values())
+    if pattern == "rising":
+        holds = all(x < y for x, y in pairwise(series))
+    elif pattern == "falling":
+        holds = all(x > y for x, y in pairwise(series))
+    else:
+        at = str(require(check, "at", str))
+        if at not in totals:
+            raise InputError("trend 'at' must be one of the periods")
+        others = [v for k, v in totals.items() if k != at]
+        holds = (
+            all(totals[at] > v for v in others)
+            if pattern == "peak"
+            else all(totals[at] < v for v in others)
+        )
+    evidence = {"pattern": pattern, "agg": agg, "totals": totals, "pattern_holds": holds}
+    if "at" in check:
+        evidence["at"] = check["at"]
+    return holds, evidence
+
+
 def recalculate(kind: str, check: dict[str, Any], root: str | Path) -> tuple[float, dict[str, Any]]:
     """Return (expected value, extra evidence) for one check."""
     if kind == "percentage":
@@ -208,6 +332,23 @@ def recalculate(kind: str, check: dict[str, Any], root: str | Path) -> tuple[flo
                 return statistics.linear_regression(xs, ys).slope, evidence
             except statistics.StatisticsError:
                 raise DataError("'column2' is constant, so the slope is undefined") from None
+        if op in ("welch_t", "welch_p"):
+            first, second = _csv_groups(root, check)
+            t, df = welch(first, second)
+            evidence.update(
+                group_column=check["group_column"],
+                groups=check["groups"],
+                n=[len(first), len(second)],
+                df=round(df, 3),
+            )
+            if op == "welch_t":
+                return t, evidence
+            tails = check.get("tails", 2)
+            if tails not in (1, 2):
+                raise InputError("tails must be 1 or 2")
+            p = t_two_sided_p(t, df)
+            evidence["tails"] = tails
+            return (p if tails == 2 else p / 2), evidence
         values = _csv_column(root, check)
         return AGGREGATES[op](values), {**evidence, "rows_used": len(values)}
     if kind == "match":
@@ -238,6 +379,33 @@ def dataproof(data: dict[str, Any], root: str | Path = ".") -> dict[str, Any]:
     out: list[dict[str, Any]] = []
     for index, check in enumerate(checks):
         kind = require(check, "type", str)
+        if kind == "trend":
+            try:
+                holds, trend_evidence = _trend(check, root)
+            except KeyError as exc:
+                raise InputError(f"Check {index} (trend) is missing {exc.args[0]!r}") from None
+            except DataError as exc:
+                out.append(
+                    finding(
+                        "ERROR",
+                        str(exc),
+                        type=kind,
+                        label=check.get("label"),
+                        lineage=check.get("lineage", []),
+                    )
+                )
+                continue
+            out.append(
+                finding(
+                    "PASS" if holds else "MISMATCH",
+                    "Recalculated from the supplied data.",
+                    type=kind,
+                    label=check.get("label"),
+                    lineage=check.get("lineage", []),
+                    **trend_evidence,
+                )
+            )
+            continue
         reported = number(check.get("reported"))
         try:
             expected, extra = recalculate(kind, check, root)

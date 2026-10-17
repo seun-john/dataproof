@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+`csv` operations `welch_t` and `welch_p`: Welch's t statistic and its p-value (two-sided, or one-sided with `tails: 1`) for two groups of a column, using only the standard library. Tested against the closed forms for 1 and 2 degrees of freedom and published table values.
+A `trend` check type: tests that totals over ordered periods are rising, falling, or peak or trough at a named period, and shows the totals.
+Limits section no longer says t-tests cannot be checked.
 - The report has a `coverage` block (checks decided and undecided, reasons, and a note that claims without a check are not counted), a one-line summary on stderr, and the same line in the HTML report.
 - `--min-coverage PCT`: exit 3 when fewer than PCT percent of checks were decided and nothing else failed.
 - `csv` checks accept `filter` (`equals`, `not_equals`, `in`, `gt`, `gte`, `lt`, `lte`; one condition or a list), so group means, sums and counts can be checked.
