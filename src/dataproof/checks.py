@@ -458,7 +458,7 @@ def dataproof(data: dict[str, Any], root: str | Path = ".") -> dict[str, Any]:
             {"data_unusable": errored},
             notes=[
                 "only the claims written as checks were examined; claims with no check "
-                "(for example t-tests) were not"
+                "(for example a paired test or a regression coefficient) were not"
             ],
         ),
         scope="recalculation only; does not judge whether the right quantity was reported",
